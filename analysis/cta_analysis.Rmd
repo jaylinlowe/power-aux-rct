@@ -1,0 +1,253 @@
+---
+title: "EDM Paper Exploration"
+output: html_document
+date: "2024-02-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(randomForest)
+library(caret)
+library(tidyverse)
+library(shiny)
+library(shinydashboard)
+library(shinyalert)
+library(scales)
+library(xtable)
+```
+
+This code is dependent on functions found in the `auxRCT` package, which can be found at "https://github.com/jaylinlowe/auxRCT". 
+    
+## LOAD IN DATA AND PREPROCESSING
+```{r}
+#These files are created by the 01-make-data.R file 
+load("data/HS_MSdata.Rdata")
+load("data/xwalk/grade_xwalk.Rdata")
+
+covs <- covsRem_noscale %>%
+  select(CAMPUS, GRDTYPE, GRDSPAN, CFLCHART, DTYPE, C_RATING_67, OUTTYPE, ends_with("_67"), ends_with("_67_mis"))
+
+df <- outRem %>%
+  left_join(covs, by = "CAMPUS") %>%
+  mutate(out = case_when(GRDTYPE %in% c("S", "B") & !is.na(outhA08) ~ outhA08,
+                                           GRDTYPE %in% c("M", "E") ~ outmA08,
+                                           GRDTYPE %in% c("S", "B") & is.na(outhA08) ~ outmA08)) %>%
+  select(out, CAMPUS, GRDTYPE, GRDSPAN, CFLCHART, DTYPE, C_RATING_67, OUTTYPE, ends_with("_67"), ends_with("_67_mis")) %>%
+  filter(!is.na(out))
+
+length(colnames(df))-1
+
+length(unique(df$CAMPUS)) - 44
+```
+
+
+## HELPFUL FUNCTIONS
+
+This is a modified version of reloop.samp from my R package. It's modified to also get the OLS adjusted MSE so we can make comparisons.
+
+```{r}
+reloop.samp.mod <- function(Y, X, grouping_col, preds, effect_size, alpha, beta) {
+
+  if (!grouping_col %in% colnames(X)) {
+    stop("grouping_col must be the name of a column in X")
+  }
+
+  df <- cbind(Y, X, preds)
+
+  groups <- unique(X[[grouping_col]])
+  results <- data.frame()
+  indices <- list()
+  for (i in 1:length(groups)) {
+    subgroup_index <- which(df[[grouping_col]] == groups[i])
+    indices[[i]] <- subgroup_index
+    subgroup <- df[subgroup_index, ]
+    
+    rf_mse <- sum((subgroup$Y - subgroup$preds)^2)/nrow(subgroup)
+  
+    mean_imputation_whole_mse <- sum((subgroup$Y - mean(df$Y))^2)/nrow(subgroup)
+  
+    mean_imputation_part_mse <- sum((subgroup$Y - mean(subgroup$Y))^2)/nrow(subgroup)
+  
+    #lm_formula <- as.formula(str_c(Y, "~", preds))
+    lm_model <- lm(Y ~ preds, data = subgroup)
+    ols_mse <- sum((subgroup$Y - predict(lm_model))^2)/nrow(subgroup)
+    
+    r <- data.frame(def = groups[i], 'RF MSE' = rf_mse, 'OLS recalibration MSE' = ols_mse, 'num' = nrow(subgroup),
+                    'variance' = var(subgroup$Y), "resid_var" = var(subgroup$preds-subgroup$Y), 'resid_var_recalib' = var(subgroup$Y - predict(lm_model)))
+    results <- rbind(results, r)
+  }
+
+  results$samp_size <- unlist(lapply(as.numeric(results$resid_var),samp_size, effect_size = effect_size, alpha = alpha, beta = beta))
+  results$samp_size_recalib <- unlist(lapply(as.numeric(results$resid_var_recalib),samp_size, effect_size = effect_size, alpha = alpha, beta = beta))
+  results$samp_size_without <- unlist(lapply(as.numeric(results$variance), samp_size, effect_size = effect_size, alpha = alpha, beta = beta))
+
+  sort_order <- order(results$def)
+
+  indices_new <- list()
+  for (j in 1:length(indices)) {
+    indices_new[[j]] <- indices[[sort_order[j]]]
+  }
+
+  return(list(arrange(results, def), indices_new))
+}
+```
+
+
+## CREATING SUBGROUPS 
+```{r}
+
+set.seed(103821)
+rf_model <- randomForest(out ~ . - CAMPUS - GRDTYPE - GRDSPAN - DTYPE - OUTTYPE, data = df)
+
+varImp_original <- varImp(rf_model) %>%
+  as.data.frame() %>%
+  arrange(desc(Overall)) %>%
+  head(40)
+
+df$rf_preds <- predict(rf_model)
+
+sum((df$rf_preds - df$out)^2)/nrow(df) #overall MSE 
+
+
+#run second random forest and get variables that are important in that random forest
+set.seed(3928)
+df$abs_errors <- abs(df$out - df$rf_preds)
+rf_errors <- randomForest(abs_errors ~ . - CAMPUS - GRDTYPE - GRDSPAN - DTYPE - OUTTYPE - rf_preds - out, data = df)
+
+varImp_errors <- varImp(rf_errors) %>%
+  as.data.frame() %>%
+  arrange(desc(Overall)) %>%
+  head(40)
+
+
+variables <- unique(c(rownames(varImp_errors), rownames(varImp_original), "CFLCHART"))
+
+final <- data.frame()
+
+for (i in 1:length(variables)) {
+  print(variables[i])
+  
+  #for numeric, use numeric subgroups function 
+  if (class(df[[variables[i]]]) == "numeric" & str_sub(variables[i], -4, -1) != "_mis") {
+    df$subgroup_def <- numeric_subgroups(Y = df$out, X = select(df, -out, -rf_preds, -abs_errors), grouping_col = variables[i], preds = df$rf_preds, max_groups = 10)
+  }
+  
+  if (class(df[[variables[i]]]) == "character" | str_sub(variables[i], -4, -1) == "_mis") {
+    df$subgroup_def <- df[[variables[i]]]
+  }
+  
+  #now get MSEs and sample size calculations
+  subgroup_results <- reloop.samp.mod(Y = df$out, X = select(df, -out, -rf_preds, -abs_errors), grouping_col = "subgroup_def", preds = df$rf_preds, effect_size = 0.2 * sd(df$out), alpha = 0.05, beta = 0.2)
+  
+  final <- rbind(final, cbind(cbind('variable' = rep(variables[[i]], length(subgroup_results[[1]])), subgroup_results[[1]])))
+}
+
+
+#separately do the best-case worst case scenario ones and then append them
+df$subgroup_def <- error_subgroups(Y = df$out, X = select(df, -out, -rf_preds, -abs_errors, -CAMPUS, -GRDTYPE, -DTYPE, -OUTTYPE), preds = df$rf_preds)
+best_worst_results <- reloop.samp.mod(Y = df$out, X = select(df, -out, -rf_preds, -abs_errors), grouping_col = "subgroup_def", preds = df$rf_preds, effect_size = 0.2 * sd(df$out), alpha = 0.05, beta = 0.2)
+
+final <- rbind(final, cbind('variable' = "best-worst case scenario", best_worst_results[[1]]))
+
+#remove duplicates
+final_no_dupes <- distinct(final) 
+```
+
+
+```{r}
+final_no_dupes %>%
+  mutate(variance_diff = resid_var - resid_var_recalib) %>%
+  arrange(-variance_diff)
+```
+
+
+## CODE FOR TABLES AND FIGURES 
+
+Table for recalibration (just for best/worst case scenario observations)
+```{r}
+recalib_table <- final_no_dupes %>%
+  filter(variable == "best-worst case scenario") %>%
+  select(def, RF.MSE, OLS.recalibration.MSE, variance, resid_var, resid_var_recalib) %>%
+  rename(`Decile of Predicted Error` = def, `Random Forest MSE` = RF.MSE, `Recalibrated MSE` = OLS.recalibration.MSE, `Outcome Variance` = variance, `Residual Variance` = resid_var, `Recalibrated Residual Variance` = resid_var_recalib) 
+
+print(xtable(recalib_table), include.rownames = F)
+```
+
+
+Metrics for recalibration:
+```{r}
+#average difference between MSEs across all subgroups tested 
+mean(final_no_dupes$RF.MSE - final_no_dupes$OLS.recalibration.MSE) #0.967
+
+fig1 <- final_no_dupes %>%
+  mutate(mse_diff = RF.MSE - OLS.recalibration.MSE) %>%
+  ggplot(aes(x = mse_diff)) + geom_histogram() +
+  theme_minimal() +
+  labs(x = "Difference", y = "Frequency") 
+ggsave("fig1.png", fig1)
+```
+
+Some tables of actual sample sizes:
+
+```{r}
+best_worst_table <- final_no_dupes %>%
+  filter(variable == "best-worst case scenario") %>%
+  select(def, samp_size, samp_size_without) %>%
+  rename(`Decile` = def, `Necessary Sample Size Without Auxiliary Data` = samp_size_without, `Necessary Sample Size With Auxiliary Data` = samp_size) %>%
+  mutate(across(2:3, round, 2))
+
+print(xtable(best_worst_table), include.rownames = F)
+```
+
+Some other interesting results 
+```{r}
+other_results <- final_no_dupes %>%
+  select(variable, def, num, samp_size, samp_size_without) %>%
+  filter(variable %in% c("CFLCHART", "CA311TA07R_67"))
+
+print(xtable(other_results), include.rownames = F)
+```
+
+
+
+
+MAYBE DELETE THIS: 
+Subgroups with highest sample sizes:
+```{r}
+results_low <- final_no_dupes %>%
+  filter(variable != "best-worst case scenario") %>%
+  arrange(samp_size) %>%
+  select(variable, def, samp_size, samp_size_without) %>%
+  head(10) %>%
+  rename(`Covariate` = variable, `Definition` = def, `With Auxiliary Data` = samp_size, `Without Auxiliary Data` = samp_size_without)
+
+print(xtable(results_low), include.rownames = F)
+
+results_high <- final_no_dupes %>%
+  filter(variable != "best-worst case scenario") %>%
+  arrange(-samp_size) %>%
+  select(variable, def, samp_size, samp_size_without) %>%
+  head(10) %>%
+  rename(`Covariate` = variable, `Definition` = def, `With Auxiliary Data` = samp_size, `Without Auxiliary Data` = samp_size_without)
+
+print(xtable(results_high), include.rownames = F)
+#probably a lot of overlap in these sample sizes
+#schools that we had very little data on 
+```
+
+```{r}
+#export dataset
+
+df_export <- df %>%
+  select(-rf_preds, -abs_errors, -subgroup_def)
+write.csv(df_export, "df_export.csv")
+
+
+#export dataset with 80 covariates
+
+df_export2 <- df %>%
+  select(out, all_of(variables))
+
+write.csv(df_export2, "df_export2.csv")
+```
+
